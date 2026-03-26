@@ -102,6 +102,7 @@ def english_cleaners2(text):
 
 def greek_cleaners(text):
   '''Pipeline for Greek text using espeak-ng phonemizer with stress marks.'''
+  text = re.sub(r'[\u2018\u2019\u201C\u201D\u2013\u2014]', '', text)
   text = lowercase(text)
   text = collapse_whitespace(text)
   phonemes = phonemize(text, language='el', backend='espeak', strip=True, preserve_punctuation=True, with_stress=True)
