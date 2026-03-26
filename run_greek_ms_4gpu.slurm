@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=vits-greek-ms-4gpu
+#SBATCH --job-name=vits-greek-ms-2spk-4gpu
 #SBATCH --account=EUHPC_D29_081
 #SBATCH --partition=boost_usr_prod
 #SBATCH --nodes=1
@@ -45,8 +45,8 @@ export NCCL_DEBUG=WARN
 
 # --- Paths ---
 VITS_DIR="/leonardo_work/EUHPC_D29_081/gsyllas0/vits"
-CONFIG="${VITS_DIR}/configs/greek_ms_from_scratch_4gpu.json"
-MODEL_NAME="greek_ms_from_scratch_4gpu"
+CONFIG="${VITS_DIR}/configs/greek_ms_2spk_4gpu.json"
+MODEL_NAME="greek_ms_2spk_4gpu"
 
 cd "${VITS_DIR}"
 mkdir -p logs

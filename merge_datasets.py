@@ -35,7 +35,7 @@ def main():
                         help="Paths to dataset folders (each with metadata.csv + wavs/)")
     parser.add_argument("--output_dir", default="filelists",
                         help="Directory to write output filelists")
-    parser.add_argument("--prefix", default="greek_ms",
+    parser.add_argument("--prefix", default="greek_ms_2spk",
                         help="Prefix for output filenames")
     parser.add_argument("--val_ratio", type=float, default=0.005,
                         help="Fraction of data for validation")
