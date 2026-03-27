@@ -92,6 +92,7 @@ def main():
   parser.add_argument("--text_cleaners", nargs="+", required=True)
   parser.add_argument("--chunk_size", type=int, default=200)
   parser.add_argument("--max_bad_lines", type=int, default=20)
+  parser.add_argument("--progress_every", type=int, default=10)
   args = parser.parse_args()
 
   with open(args.filelist, encoding="utf-8") as f:
@@ -113,46 +114,51 @@ def main():
     print("Fix field-count issues first.")
     sys.exit(1)
 
-  bad_chunks = []
-  for start in range(0, len(rows), args.chunk_size):
+  total_chunks = (len(rows) + args.chunk_size - 1) // args.chunk_size
+  first_bad_chunk = None
+  for chunk_idx, start in enumerate(range(0, len(rows), args.chunk_size), start=1):
     end = min(start + args.chunk_size, len(rows))
+    if chunk_idx == 1 or chunk_idx % args.progress_every == 0 or chunk_idx == total_chunks:
+      print(f"Checking chunk {chunk_idx}/{total_chunks} (lines {start + 1}-{end})...", flush=True)
     result = run_chunk(args.filelist, args.text_index, args.text_cleaners, start, end)
     if result.returncode != 0:
-      bad_chunks.append((start, end, result))
+      first_bad_chunk = (start, end, result)
       print(f"Chunk {start + 1}-{end} failed with code {result.returncode}")
       if result.stderr.strip():
         print(result.stderr.strip()[:2000])
+      break
 
-  if not bad_chunks:
+  if first_bad_chunk is None:
     print("No crashing chunks found.")
     return
 
   found = 0
-  for start, end, _ in bad_chunks:
-    for i in range(start, end):
-      result = run_chunk(args.filelist, args.text_index, args.text_cleaners, i, i + 1)
-      if result.returncode == 0:
-        continue
-      found += 1
-      text_value = rows[i][args.text_index]
+  start, end, _ = first_bad_chunk
+  print(f"Isolating bad lines within {start + 1}-{end}...", flush=True)
+  for i in range(start, end):
+    result = run_chunk(args.filelist, args.text_index, args.text_cleaners, i, i + 1)
+    if result.returncode == 0:
+      continue
+    found += 1
+    text_value = rows[i][args.text_index]
+    print()
+    print(f"Bad line {i + 1}:")
+    print(raw_lines[i])
+    suspicious = describe_suspicious_chars(text_value)
+    if suspicious:
+      print("  Suspicious chars:")
+      for item in suspicious[:50]:
+        print(f"    {item}")
+    if result.stderr.strip():
+      print("  stderr:")
+      print(result.stderr.strip()[:4000])
+    if found >= args.max_bad_lines:
       print()
-      print(f"Bad line {i + 1}:")
-      print(raw_lines[i])
-      suspicious = describe_suspicious_chars(text_value)
-      if suspicious:
-        print("  Suspicious chars:")
-        for item in suspicious[:50]:
-          print(f"    {item}")
-      if result.stderr.strip():
-        print("  stderr:")
-        print(result.stderr.strip()[:4000])
-      if found >= args.max_bad_lines:
-        print()
-        print(f"Stopping after {found} bad lines.")
-        return
+      print(f"Stopping after {found} bad lines.")
+      return
 
   if found == 0:
-    print("Chunks failed, but no single crashing line was isolated.")
+    print("A chunk failed, but no single crashing line was isolated.")
 
 
 if __name__ == "__main__":
