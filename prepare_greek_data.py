@@ -62,10 +62,53 @@ def load_split(dataset_obj, split_name):
     return dataset_obj
 
 
-def build_speaker_set(speaker_durations, include_speakers, min_speaker_hours):
-    if include_speakers:
+def find_speaker_mapping_path(dataset_path, explicit_path=None):
+    if explicit_path:
+        return explicit_path
+    candidate = os.path.join(dataset_path, "speaker_id_mapping.json")
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def load_source_speaker_mapping(mapping_path):
+    if not mapping_path:
+        return {}, {}
+
+    with open(mapping_path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    raw_mapping = payload.get("mapping") or payload.get("speaker_to_id") or {}
+    label_to_raw = {str(label): str(raw_value) for label, raw_value in raw_mapping.items()}
+    raw_to_label = {raw_value: label for label, raw_value in label_to_raw.items()}
+    return label_to_raw, raw_to_label
+
+
+def resolve_requested_speakers(include_speakers, label_to_raw, raw_to_label):
+    if not include_speakers:
+        return None
+
+    resolved = []
+    for requested in include_speakers:
+        requested = str(requested)
+        raw_value = label_to_raw.get(requested, requested)
+        resolved.append(str(raw_value))
+
+    pretty = [f"{requested}->{raw_to_label.get(raw, raw)}({raw})"
+              for requested, raw in zip(include_speakers, resolved)]
+    print("Resolved requested speakers:", ", ".join(pretty))
+    return resolved
+
+
+def speaker_label(raw_speaker, raw_to_label):
+    raw_speaker = str(raw_speaker)
+    return raw_to_label.get(raw_speaker, raw_speaker)
+
+
+def build_speaker_set(speaker_durations, requested_raw_speakers, min_speaker_hours):
+    if requested_raw_speakers:
         speakers = []
-        for spk in include_speakers:
+        for spk in requested_raw_speakers:
             hours = speaker_durations.get(spk, 0.0) / 3600.0
             if spk not in speaker_durations:
                 print(f"  Requested speaker not found: {spk}")
@@ -86,10 +129,11 @@ def build_speaker_set(speaker_durations, include_speakers, min_speaker_hours):
     return speakers
 
 
-def scan_dataset(ds, args, speaker_durations, sample_rate_counts):
+def scan_dataset(ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers):
+    requested_set = set(requested_raw_speakers) if requested_raw_speakers else None
     for example in ds:
         spk = str(example[args.speaker_column])
-        if args.include_speakers and spk not in args.include_speakers:
+        if requested_set and spk not in requested_set:
             continue
         audio = example[args.audio_column]
         sr = int(audio["sampling_rate"])
@@ -162,6 +206,8 @@ def main():
                         help="Optional validation split to use directly from a DatasetDict")
     parser.add_argument("--include_speakers", nargs="+", default=None,
                         help="Optional speaker labels to keep, in the exact order they should be mapped")
+    parser.add_argument("--speaker_mapping_json", default=None,
+                        help="Optional JSON file that maps human-readable speaker labels to dataset speaker_id values")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -174,16 +220,33 @@ def main():
     train_ds = load_split(ds_obj, args.split)
     val_ds = load_split(ds_obj, args.val_split) if args.val_split else None
 
+    source_mapping_path = None
+    label_to_raw, raw_to_label = {}, {}
+    if args.speaker_column == "speaker_id":
+        source_mapping_path = find_speaker_mapping_path(args.dataset_path, args.speaker_mapping_json)
+        label_to_raw, raw_to_label = load_source_speaker_mapping(source_mapping_path)
+        if source_mapping_path:
+            print(f"Loaded source speaker mapping: {source_mapping_path}")
+    else:
+        print(f"Filtering speakers directly with column: {args.speaker_column}")
+        if args.speaker_mapping_json:
+            print(
+                f"Ignoring --speaker_mapping_json because --speaker_column={args.speaker_column} "
+                f"already contains speaker labels."
+            )
+
+    requested_raw_speakers = resolve_requested_speakers(args.include_speakers, label_to_raw, raw_to_label)
+
     speaker_durations = defaultdict(float)  # seconds
     sample_rate_counts = Counter()
     print("Scanning dataset for speaker durations and sampling rates ...")
-    scan_dataset(train_ds, args, speaker_durations, sample_rate_counts)
+    scan_dataset(train_ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers)
     if val_ds is not None:
-        scan_dataset(val_ds, args, speaker_durations, sample_rate_counts)
+        scan_dataset(val_ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers)
 
     valid_speakers = build_speaker_set(
         speaker_durations=speaker_durations,
-        include_speakers=args.include_speakers,
+        requested_raw_speakers=requested_raw_speakers,
         min_speaker_hours=args.min_speaker_hours,
     )
     if not valid_speakers:
@@ -191,10 +254,15 @@ def main():
 
     # Create integer speaker ID mapping
     spk_to_id = {spk: idx for idx, spk in enumerate(valid_speakers)}
+    speaker_name_to_id = {speaker_label(spk, raw_to_label): idx for spk, idx in spk_to_id.items()}
     n_speakers = len(valid_speakers)
     print(f"Total speakers after filtering: {n_speakers}")
     for spk in valid_speakers:
-        print(f"  speaker {spk!r} -> {spk_to_id[spk]} ({speaker_durations[spk] / 3600.0:.2f}h)")
+        print(
+            f"  speaker {speaker_label(spk, raw_to_label)!r} "
+            f"(source id {spk}) -> {spk_to_id[spk]} "
+            f"({speaker_durations[spk] / 3600.0:.2f}h)"
+        )
 
     if sample_rate_counts:
         sr_summary = ", ".join(
@@ -207,14 +275,16 @@ def main():
     with open(mapping_path, "w", encoding="utf-8") as f:
         json.dump(
             {
-                "speaker_to_id": spk_to_id,
-                "mapping": spk_to_id,
+                "speaker_to_id": speaker_name_to_id,
+                "mapping": speaker_name_to_id,
+                "source_speaker_values": {speaker_label(spk, raw_to_label): spk for spk in valid_speakers},
                 "n_speakers": n_speakers,
                 "num_speakers": n_speakers,
                 "source_dataset": args.dataset_path,
                 "train_split": args.split,
                 "val_split": args.val_split,
                 "target_sr": args.target_sr,
+                "source_speaker_mapping_json": source_mapping_path,
             },
             f,
             indent=2,

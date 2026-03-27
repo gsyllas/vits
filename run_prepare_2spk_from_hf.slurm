@@ -30,6 +30,7 @@ python prepare_greek_data.py \
   --dataset_path "${HF_DATASET}" \
   --split train \
   --val_split eval \
+  --speaker_column speaker_name \
   --include_speakers female male \
   --output_wav_dir "${OUTPUT_WAV_DIR}" \
   --output_filelist_dir filelists \
