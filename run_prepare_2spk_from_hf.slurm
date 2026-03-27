@@ -26,7 +26,7 @@ mkdir -p logs
 
 echo "$(date): Preparing female/male subset from ${HF_DATASET}"
 
-python prepare_greek_data.py \
+python -u prepare_greek_data.py \
   --dataset_path "${HF_DATASET}" \
   --split train \
   --val_split eval \

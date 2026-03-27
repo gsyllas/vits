@@ -34,6 +34,7 @@ from datasets import Dataset, DatasetDict, load_from_disk
 
 _CONTROL_RE = re.compile(r"[\u0000-\u001f\u007f-\u009f]+")
 _WHITESPACE_RE = re.compile(r"\s+")
+_PROGRESS_EVERY = 1000
 
 
 def clean_filelist_text(text, delimiter="|"):
@@ -96,7 +97,7 @@ def resolve_requested_speakers(include_speakers, label_to_raw, raw_to_label):
 
     pretty = [f"{requested}->{raw_to_label.get(raw, raw)}({raw})"
               for requested, raw in zip(include_speakers, resolved)]
-    print("Resolved requested speakers:", ", ".join(pretty))
+    print("Resolved requested speakers:", ", ".join(pretty), flush=True)
     return resolved
 
 
@@ -131,7 +132,8 @@ def build_speaker_set(speaker_durations, requested_raw_speakers, min_speaker_hou
 
 def scan_dataset(ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers):
     requested_set = set(requested_raw_speakers) if requested_raw_speakers else None
-    for example in ds:
+    matched = 0
+    for i, example in enumerate(ds, start=1):
         spk = str(example[args.speaker_column])
         if requested_set and spk not in requested_set:
             continue
@@ -140,6 +142,12 @@ def scan_dataset(ds, args, speaker_durations, sample_rate_counts, requested_raw_
         duration = len(audio["array"]) / sr
         speaker_durations[spk] += duration
         sample_rate_counts[sr] += 1
+        matched += 1
+        if matched % _PROGRESS_EVERY == 0:
+            print(
+                f"  scan progress: visited={i}, matched={matched}, last_sr={sr}",
+                flush=True,
+            )
 
 
 def export_entries(ds, split_name, spk_to_id, args):
@@ -175,8 +183,8 @@ def export_entries(ds, split_name, spk_to_id, args):
         sf.write(wav_path, array, args.target_sr)
         entries.append((wav_path, str(spk_int), text))
 
-        if (i + 1) % 1000 == 0:
-            print(f"  [{split_name}] processed {i + 1} examples ...")
+        if (i + 1) % _PROGRESS_EVERY == 0:
+            print(f"  [{split_name}] processed {i + 1} examples ...", flush=True)
 
     return entries, resampled
 
@@ -214,7 +222,7 @@ def main():
     os.makedirs(args.output_wav_dir, exist_ok=True)
     os.makedirs(args.output_filelist_dir, exist_ok=True)
 
-    print(f"Loading dataset from {args.dataset_path} ...")
+    print(f"Loading dataset from {args.dataset_path} ...", flush=True)
     ds_obj = load_from_disk(args.dataset_path)
 
     train_ds = load_split(ds_obj, args.split)
@@ -226,20 +234,21 @@ def main():
         source_mapping_path = find_speaker_mapping_path(args.dataset_path, args.speaker_mapping_json)
         label_to_raw, raw_to_label = load_source_speaker_mapping(source_mapping_path)
         if source_mapping_path:
-            print(f"Loaded source speaker mapping: {source_mapping_path}")
+            print(f"Loaded source speaker mapping: {source_mapping_path}", flush=True)
     else:
-        print(f"Filtering speakers directly with column: {args.speaker_column}")
+        print(f"Filtering speakers directly with column: {args.speaker_column}", flush=True)
         if args.speaker_mapping_json:
             print(
                 f"Ignoring --speaker_mapping_json because --speaker_column={args.speaker_column} "
-                f"already contains speaker labels."
+                f"already contains speaker labels.",
+                flush=True,
             )
 
     requested_raw_speakers = resolve_requested_speakers(args.include_speakers, label_to_raw, raw_to_label)
 
     speaker_durations = defaultdict(float)  # seconds
     sample_rate_counts = Counter()
-    print("Scanning dataset for speaker durations and sampling rates ...")
+    print("Scanning dataset for speaker durations and sampling rates ...", flush=True)
     scan_dataset(train_ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers)
     if val_ds is not None:
         scan_dataset(val_ds, args, speaker_durations, sample_rate_counts, requested_raw_speakers)
@@ -256,19 +265,20 @@ def main():
     spk_to_id = {spk: idx for idx, spk in enumerate(valid_speakers)}
     speaker_name_to_id = {speaker_label(spk, raw_to_label): idx for spk, idx in spk_to_id.items()}
     n_speakers = len(valid_speakers)
-    print(f"Total speakers after filtering: {n_speakers}")
+    print(f"Total speakers after filtering: {n_speakers}", flush=True)
     for spk in valid_speakers:
         print(
             f"  speaker {speaker_label(spk, raw_to_label)!r} "
             f"(source id {spk}) -> {spk_to_id[spk]} "
-            f"({speaker_durations[spk] / 3600.0:.2f}h)"
+            f"({speaker_durations[spk] / 3600.0:.2f}h)",
+            flush=True,
         )
 
     if sample_rate_counts:
         sr_summary = ", ".join(
             f"{sr}Hz={count}" for sr, count in sorted(sample_rate_counts.items())
         )
-        print(f"Observed input sampling rates: {sr_summary}")
+        print(f"Observed input sampling rates: {sr_summary}", flush=True)
 
     # Save speaker mapping
     mapping_path = os.path.join(args.output_filelist_dir, f"{args.filelist_prefix}_speaker_map.json")
@@ -290,18 +300,18 @@ def main():
             indent=2,
             ensure_ascii=False,
         )
-    print(f"Speaker mapping saved to {mapping_path}")
+    print(f"Speaker mapping saved to {mapping_path}", flush=True)
 
     # Export WAVs and build filelist entries.
     if val_ds is not None:
-        print(f"Exporting training split '{args.split}' ...")
+        print(f"Exporting training split '{args.split}' ...", flush=True)
         train_entries, train_resampled = export_entries(train_ds, args.split, spk_to_id, args)
-        print(f"Exporting validation split '{args.val_split}' ...")
+        print(f"Exporting validation split '{args.val_split}' ...", flush=True)
         val_entries, val_resampled = export_entries(val_ds, args.val_split, spk_to_id, args)
         random.shuffle(train_entries)
         random.shuffle(val_entries)
     else:
-        print(f"Exporting source split '{args.split}' ...")
+        print(f"Exporting source split '{args.split}' ...", flush=True)
         entries, total_resampled = export_entries(train_ds, args.split, spk_to_id, args)
         random.shuffle(entries)
         n_val = max(1, int(len(entries) * args.val_ratio))
@@ -310,8 +320,8 @@ def main():
         train_resampled = total_resampled
         val_resampled = 0
 
-    print(f"Total valid train entries: {len(train_entries)}")
-    print(f"Total valid val entries: {len(val_entries)}")
+    print(f"Total valid train entries: {len(train_entries)}", flush=True)
+    print(f"Total valid val entries: {len(val_entries)}", flush=True)
 
     # Write filelists
     train_path = os.path.join(args.output_filelist_dir,
@@ -323,21 +333,25 @@ def main():
         with open(path, "w", encoding="utf-8") as f:
             for wav, sid, text in data:
                 f.write(f"{wav}|{sid}|{text}\n")
-        print(f"Written {len(data)} entries to {path}")
+        print(f"Written {len(data)} entries to {path}", flush=True)
 
-    print(f"\n--- Summary ---")
-    print(f"n_speakers: {n_speakers}")
-    print(f"Train samples: {len(train_entries)}")
-    print(f"Val samples: {len(val_entries)}")
+    print(f"\n--- Summary ---", flush=True)
+    print(f"n_speakers: {n_speakers}", flush=True)
+    print(f"Train samples: {len(train_entries)}", flush=True)
+    print(f"Val samples: {len(val_entries)}", flush=True)
     if any(sr != args.target_sr for sr in sample_rate_counts):
         print(
             f"Input audio was not uniformly {args.target_sr} Hz; exported WAVs were resampled to {args.target_sr} Hz "
-            f"(train={train_resampled}, val={val_resampled})."
+            f"(train={train_resampled}, val={val_resampled}).",
+            flush=True,
         )
     else:
-        print(f"All included input audio was already {args.target_sr} Hz.")
-    print("Text was kept mostly raw; only control characters, repeated whitespace, and the filelist delimiter '|' were normalized.")
-    print(f"Set n_speakers={n_speakers} in your config JSON.")
+        print(f"All included input audio was already {args.target_sr} Hz.", flush=True)
+    print(
+        "Text was kept mostly raw; only control characters, repeated whitespace, and the filelist delimiter '|' were normalized.",
+        flush=True,
+    )
+    print(f"Set n_speakers={n_speakers} in your config JSON.", flush=True)
 
 
 if __name__ == "__main__":
