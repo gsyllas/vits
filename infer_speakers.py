@@ -1,11 +1,11 @@
 """
-Speaker-identity check: synthesizes 2 sentences per speaker and optionally
-extracts a ground truth sample per speaker from the validation filelist.
+Speaker-identity check: synthesizes baseline validation texts for selected
+speakers and optionally copies the matching ground-truth wavs for 1:1
+comparison.
 
 Usage:
-    python infer_speakers.py \
+    python3 infer_speakers.py \
         --config configs/greek_ms_from_scratch_4gpu.json \
-        --checkpoint logs/greek_ms_from_scratch_4gpu/G_84000.pth \
         --output_dir speaker_samples/4gpu \
         --gt_dir speaker_samples/baseline
 """
@@ -22,10 +22,8 @@ from text.symbols import symbols
 from text import cleaned_text_to_sequence
 from text.cleaners import greek_cleaners
 
-SENTENCES = [
-    "Η φωνή μου είναι μοναδική.",
-    "Το σύστημα αυτό μαθαίνει να μιλά.",
-]
+DEFAULT_SPEAKERS = [0, 1]
+DEFAULT_SAMPLES_PER_SPEAKER = 5
 
 
 def get_text(text, hps):
@@ -36,48 +34,135 @@ def get_text(text, hps):
     return torch.LongTensor(text_norm)
 
 
-def extract_gt_samples(val_filelist, gt_dir, n_speakers):
-    """Copy one GT wav per speaker from the validation filelist."""
-    os.makedirs(gt_dir, exist_ok=True)
-    found = {}
+def resolve_model_dir(config_path, model_dir=None):
+    if model_dir:
+        return model_dir
+    if os.path.basename(config_path) == "config.json":
+        return os.path.dirname(os.path.abspath(config_path))
+    config_name = os.path.splitext(os.path.basename(config_path))[0]
+    return os.path.join("logs", config_name)
+
+
+def resolve_checkpoint(checkpoint_path, model_dir):
+    if checkpoint_path:
+        return checkpoint_path
+    if not os.path.isdir(model_dir):
+        raise FileNotFoundError(f"Model directory not found: {model_dir}")
     try:
-        with open(val_filelist) as f:
+        return utils.latest_checkpoint_path(model_dir, "G_*.pth")
+    except IndexError as exc:
+        raise FileNotFoundError(
+            f"No generator checkpoints found in {model_dir}"
+        ) from exc
+
+
+def get_source_filelists(hps, filelist_override=None):
+    if filelist_override:
+        return [filelist_override]
+
+    filelists = []
+    for candidate in [hps.data.validation_files, hps.data.training_files]:
+        if candidate and candidate not in filelists:
+            filelists.append(candidate)
+    return filelists
+
+
+def collect_speaker_examples(filelist_paths, speaker_ids, samples_per_speaker):
+    examples = {sid: [] for sid in speaker_ids}
+    seen_wavs = set()
+
+    for filelist_path in filelist_paths:
+        with open(filelist_path, encoding="utf-8") as f:
             for line in f:
-                parts = line.strip().split("|")
-                if len(parts) < 2:
+                parts = line.strip().split("|", 2)
+                if len(parts) < 3:
                     continue
-                wav_path, sid = parts[0], int(parts[1])
-                if sid not in found and os.path.exists(wav_path):
-                    dst = os.path.join(gt_dir, f"spk{sid:02d}_gt.wav")
-                    shutil.copy(wav_path, dst)
-                    found[sid] = dst
-                    print(f"  GT spk{sid:02d} -> {dst}")
-                if len(found) == n_speakers:
+                wav_path, sid_str, text = parts
+                try:
+                    sid = int(sid_str)
+                except ValueError:
+                    continue
+                if sid not in examples or len(examples[sid]) >= samples_per_speaker:
+                    continue
+                if wav_path in seen_wavs or not os.path.exists(wav_path):
+                    continue
+
+                examples[sid].append({
+                    "wav_path": wav_path,
+                    "text": text,
+                })
+                seen_wavs.add(wav_path)
+
+                if all(len(examples[s]) >= samples_per_speaker for s in speaker_ids):
                     break
-    except FileNotFoundError:
-        print(f"  Warning: val filelist not found: {val_filelist}")
-    return found
+        if all(len(examples[s]) >= samples_per_speaker for s in speaker_ids):
+            break
+
+    missing = [
+        f"speaker {sid}: found {len(samples)}/{samples_per_speaker}"
+        for sid, samples in examples.items()
+        if len(samples) < samples_per_speaker
+    ]
+    if missing:
+        details = ", ".join(missing)
+        raise RuntimeError(
+            "Could not collect enough baseline samples from "
+            f"{', '.join(filelist_paths)}: {details}"
+        )
+    return examples
+
+
+def write_manifest(output_dir, examples):
+    manifest_path = os.path.join(output_dir, "sentences.txt")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        for sid, samples in examples.items():
+            for i, sample in enumerate(samples, start=1):
+                f.write(f"spk{sid:02d}_sent{i:02d}|{sample['text']}\n")
+
+
+def copy_gt_samples(examples, gt_dir):
+    os.makedirs(gt_dir, exist_ok=True)
+    for sid, samples in examples.items():
+        for i, sample in enumerate(samples, start=1):
+            dst = os.path.join(gt_dir, f"spk{sid:02d}_sent{i:02d}.wav")
+            shutil.copy(sample["wav_path"], dst)
+            print(f"  GT spk{sid:02d} sent{i:02d} -> {dst}")
+    write_manifest(gt_dir, examples)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", default=None,
+                        help="If omitted, use the latest G_*.pth from model_dir")
+    parser.add_argument("--model_dir", default=None,
+                        help="Override the model directory used to resolve the latest checkpoint")
     parser.add_argument("--output_dir", default="speaker_samples/run")
     parser.add_argument("--gt_dir", default=None,
-                        help="If set, copy one GT wav per speaker here from val filelist")
-    parser.add_argument("--speakers", type=int, nargs="+", default=None)
+                        help="If set, copy matching GT wavs here from the source filelist")
+    parser.add_argument("--filelist", default=None,
+                        help="If omitted, scan validation first and then training from the config")
+    parser.add_argument("--speakers", type=int, nargs="+", default=DEFAULT_SPEAKERS)
+    parser.add_argument("--samples_per_speaker", type=int, default=DEFAULT_SAMPLES_PER_SPEAKER)
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     hps = utils.get_hparams_from_file(args.config)
-    speaker_ids = args.speakers if args.speakers else list(range(hps.data.n_speakers))
+    speaker_ids = list(dict.fromkeys(args.speakers))
+    filelist_paths = get_source_filelists(hps, args.filelist)
+    model_dir = resolve_model_dir(args.config, args.model_dir)
+    checkpoint_path = resolve_checkpoint(args.checkpoint, model_dir)
+    examples = collect_speaker_examples(filelist_paths, speaker_ids, args.samples_per_speaker)
+
+    print(f"\n--- Using examples from: {', '.join(filelist_paths)} ---")
+    print(f"Speakers: {speaker_ids}")
+    print(f"Samples per speaker: {args.samples_per_speaker}")
 
     # Ground truth baseline
     if args.gt_dir:
         print(f"\n--- Extracting GT samples -> {args.gt_dir} ---")
-        extract_gt_samples(hps.data.validation_files, args.gt_dir, hps.data.n_speakers)
+        copy_gt_samples(examples, args.gt_dir)
 
     # Load model
     net_g = SynthesizerTrn(
@@ -87,16 +172,19 @@ def main():
         n_speakers=hps.data.n_speakers,
         **hps.model).cuda()
     net_g.eval()
-    utils.load_checkpoint(args.checkpoint, net_g, None)
+    utils.load_checkpoint(checkpoint_path, net_g, None)
 
-    print(f"\n--- Synthesizing {len(speaker_ids)} speakers x {len(SENTENCES)} sentences ---")
-    print(f"Checkpoint: {args.checkpoint}")
+    print(
+        f"\n--- Synthesizing {len(speaker_ids)} speakers x "
+        f"{args.samples_per_speaker} baseline sentences ---"
+    )
+    print(f"Checkpoint: {checkpoint_path}")
 
     with torch.no_grad():
         for sid in speaker_ids:
             sid_tensor = torch.LongTensor([sid]).cuda()
-            for i, sentence in enumerate(SENTENCES):
-                stn_tst = get_text(sentence, hps)
+            for i, sample in enumerate(examples[sid], start=1):
+                stn_tst = get_text(sample["text"], hps)
                 x_tst = stn_tst.cuda().unsqueeze(0)
                 x_tst_lengths = torch.LongTensor([stn_tst.size(0)]).cuda()
 
@@ -105,9 +193,11 @@ def main():
                     noise_scale=0.667, noise_scale_w=0.8, length_scale=1
                 )[0][0, 0].data.cpu().float().numpy()
 
-                out_path = os.path.join(args.output_dir, f"spk{sid:02d}_sent{i+1}.wav")
+                out_path = os.path.join(args.output_dir, f"spk{sid:02d}_sent{i:02d}.wav")
                 write(out_path, hps.data.sampling_rate, audio)
-                print(f"  spk{sid:02d} sent{i+1} -> {out_path}")
+                print(f"  spk{sid:02d} sent{i:02d} -> {out_path}")
+
+    write_manifest(args.output_dir, examples)
 
     print("\nDone.")
 
