@@ -10,6 +10,7 @@ Usage:
         --gt_dir speaker_samples/baseline
 """
 import argparse
+import glob
 import os
 import shutil
 import torch
@@ -26,8 +27,8 @@ DEFAULT_SPEAKERS = [0, 1]
 DEFAULT_SAMPLES_PER_SPEAKER = 5
 
 
-def get_text(text, hps):
-    cleaned = greek_cleaners(text)
+def get_text(text, hps, is_cleaned=False):
+    cleaned = text if is_cleaned else greek_cleaners(text)
     text_norm = cleaned_text_to_sequence(cleaned)
     if hps.data.add_blank:
         text_norm = commons.intersperse(text_norm, 0)
@@ -58,20 +59,27 @@ def resolve_checkpoint(checkpoint_path, model_dir):
 
 def get_source_filelists(hps, filelist_override=None):
     if filelist_override:
-        return [filelist_override]
+        return [{
+            "path": filelist_override,
+            "is_cleaned": filelist_override.endswith(".cleaned"),
+        }]
 
     filelists = []
     for candidate in [hps.data.validation_files, hps.data.training_files]:
         if candidate and candidate not in filelists:
-            filelists.append(candidate)
+            filelists.append({
+                "path": candidate,
+                "is_cleaned": candidate.endswith(".cleaned"),
+            })
     return filelists
 
 
-def collect_speaker_examples(filelist_paths, speaker_ids, samples_per_speaker):
+def collect_speaker_examples(filelist_specs, speaker_ids, samples_per_speaker):
     examples = {sid: [] for sid in speaker_ids}
     seen_wavs = set()
 
-    for filelist_path in filelist_paths:
+    for filelist_spec in filelist_specs:
+        filelist_path = filelist_spec["path"]
         with open(filelist_path, encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split("|", 2)
@@ -90,6 +98,7 @@ def collect_speaker_examples(filelist_paths, speaker_ids, samples_per_speaker):
                 examples[sid].append({
                     "wav_path": wav_path,
                     "text": text,
+                    "is_cleaned": filelist_spec["is_cleaned"],
                 })
                 seen_wavs.add(wav_path)
 
@@ -107,9 +116,20 @@ def collect_speaker_examples(filelist_paths, speaker_ids, samples_per_speaker):
         details = ", ".join(missing)
         raise RuntimeError(
             "Could not collect enough baseline samples from "
-            f"{', '.join(filelist_paths)}: {details}"
+            f"{', '.join(spec['path'] for spec in filelist_specs)}: {details}"
         )
     return examples
+
+
+def cleanup_generated_files(output_dir):
+    removed = []
+    for pattern in ["spk*_sent*.wav", "sentences.txt"]:
+        for path in glob.glob(os.path.join(output_dir, pattern)):
+            if os.path.isfile(path):
+                os.remove(path)
+                removed.append(path)
+    if removed:
+        print(f"  Cleared {len(removed)} old generated files from {output_dir}")
 
 
 def write_manifest(output_dir, examples):
@@ -144,24 +164,31 @@ def main():
                         help="If omitted, scan validation first and then training from the config")
     parser.add_argument("--speakers", type=int, nargs="+", default=DEFAULT_SPEAKERS)
     parser.add_argument("--samples_per_speaker", type=int, default=DEFAULT_SAMPLES_PER_SPEAKER)
+    parser.add_argument("--keep_existing_outputs", action="store_true",
+                        help="Do not clear old spk*_sent*.wav files from output dirs before writing")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     hps = utils.get_hparams_from_file(args.config)
     speaker_ids = list(dict.fromkeys(args.speakers))
-    filelist_paths = get_source_filelists(hps, args.filelist)
+    filelist_specs = get_source_filelists(hps, args.filelist)
     model_dir = resolve_model_dir(args.config, args.model_dir)
     checkpoint_path = resolve_checkpoint(args.checkpoint, model_dir)
-    examples = collect_speaker_examples(filelist_paths, speaker_ids, args.samples_per_speaker)
+    examples = collect_speaker_examples(filelist_specs, speaker_ids, args.samples_per_speaker)
 
-    print(f"\n--- Using examples from: {', '.join(filelist_paths)} ---")
+    print(f"\n--- Using examples from: {', '.join(spec['path'] for spec in filelist_specs)} ---")
     print(f"Speakers: {speaker_ids}")
     print(f"Samples per speaker: {args.samples_per_speaker}")
+
+    if not args.keep_existing_outputs:
+        cleanup_generated_files(args.output_dir)
 
     # Ground truth baseline
     if args.gt_dir:
         print(f"\n--- Extracting GT samples -> {args.gt_dir} ---")
+        if not args.keep_existing_outputs:
+            cleanup_generated_files(args.gt_dir)
         copy_gt_samples(examples, args.gt_dir)
 
     # Load model
@@ -184,7 +211,7 @@ def main():
         for sid in speaker_ids:
             sid_tensor = torch.LongTensor([sid]).cuda()
             for i, sample in enumerate(examples[sid], start=1):
-                stn_tst = get_text(sample["text"], hps)
+                stn_tst = get_text(sample["text"], hps, is_cleaned=sample["is_cleaned"])
                 x_tst = stn_tst.cuda().unsqueeze(0)
                 x_tst_lengths = torch.LongTensor([stn_tst.size(0)]).cuda()
 
